@@ -72,3 +72,8 @@ tags
 [._]*.un~
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,vim,macos
+
+
+# Added by cargo
+
+/target
