@@ -1,5 +1,6 @@
 extern crate test;
 
+use std::default::Default;
 use std::ptr::NonNull;
 use std::cmp::{PartialOrd, Ordering};
 
@@ -63,11 +64,158 @@ impl<K, V, const C: usize, const H: usize> SkipLift<K, V, C, H> where
         bits.trailing_ones() as usize + 1
     }
 
+    pub fn get(&self, key: K) -> Option<V> {
+        // Initialize initial node and height
+        let mut h = H - 1;
+        let mut n: Link<K, V, C> = None;
+
+        // idx is 0 or 1, keeps track of node.height vs node.height - 1
+        let mut idx = 0;
+
+        // Search for value
+        while h > 0 {
+            while let Some(_n) = n {
+                let _n = unsafe { _n.as_ref() };
+
+                if (_n.height as usize) == h { break; }
+                else { n = _n.prev[1]; }
+            } 
+
+            h -= 1;
+
+            let next = if let Some(_n) = n { 
+                let _n = unsafe { _n.as_ref() };
+                _n.next[_n.height as usize - h];
+            } else {
+                self.sentinels[h] 
+            };
+
+            while let Some(n) = n {
+                let next_ref = unsafe { next.as_ref() };
+
+                match next_ref.keys.partial_cmp(&key).unwrap() {
+                    Ordering::Less => {
+                        n = Some(next)
+                    },
+                    Ordering::Equal => {
+                        return Some(next_ref.vals);
+                    },
+                    Ordering::Greater => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return None;
+
+    }
+
+    pub fn upsert(&mut self, key: K, val: V) {
+        // Initialize initial node and height
+        let mut h = H - 1;
+        let mut n: Link<K, V, C> = None;
+
+        // Allocate new node to stack
+        let mut prev = [None; 2];
+        let mut next = [None; 2];
+        let height = Self::gen_height() as u8;
+
+        // idx is 0 or 1, keeps track of node.height vs node.height - 1
+        let mut idx = 0;
+
+        // Search for value
+        while h > 0 {
+            while let Some(_n) = n {
+                let _n = unsafe { _n.as_ref() };
+
+                if (_n.height as usize) == h { break; }
+                else { n = _n.prev[1]; }
+            } 
+
+            h -= 1;
+
+            while let Some(mut next) = n.map_or(
+                self.sentinels[h], 
+                |_n| {
+                    let _n_ref = unsafe { _n.as_ref() };
+                    _n_ref.next[_n_ref.height as usize - h]
+                }
+            ) {
+                let next_ref = unsafe { next.as_mut() };
+
+                match next_ref.keys.partial_cmp(&key).unwrap() {
+                    Ordering::Less => { 
+                        // Need to keep moving right
+                        n = Some(next);
+                    },
+                    Ordering::Equal => {
+                        // Value found, update
+                        next_ref.vals = val;
+                        return;
+                    },
+                    Ordering::Greater => { break; }
+                }
+            }
+            
+            // Keep track of current, next nodes for later insertion
+            // if we're at node.height or node.height - 1
+            if idx < 2 && h == (height as usize) - idx {
+                prev[idx] = n;
+                next[idx] = n.map_or(
+                    self.sentinels[h], 
+                    |_n| {
+                        let _n_ref = unsafe { _n.as_ref() };
+                        _n_ref.next[_n_ref.height as usize - h]
+                    }
+                );
+
+                idx += 1;
+            }
+        }
+
+        // Allocate space in bump allocator
+        let node_ptr = unsafe { 
+            NonNull::new_unchecked(
+                self.alloc.alloc_with(|| Node::<K, V, C> {
+                    keys: key,
+                    vals: val,
+                    prev,
+                    next,
+                    height
+                })
+            )
+        };
+
+        let node_ref = unsafe {
+            node_ptr.as_ref()
+        };
+
+        // Insert node between previously found nodes
+        for idx in 0..=1 {
+            if let Some(mut prev) = node_ref.prev[idx] {
+                let prev_ref = unsafe { prev.as_mut() };
+                let prev_idx = ((prev_ref.height + idx as u8) - node_ref.height) as usize;
+                prev_ref.next[prev_idx] = Some(node_ptr);
+            } else {
+                self.sentinels[node_ref.height as usize - idx] = Some(node_ptr);
+            }
+
+            if let Some(mut next) = node_ref.next[idx] {
+                let next_ref = unsafe { next.as_mut() };
+                let next_idx = ((next_ref.height + idx as u8) - node_ref.height) as usize;
+
+                next_ref.prev[next_idx] = Some(node_ptr);
+            }
+        }
+
+        return;
+
+    }
+
     // Implementation of general search/insert/update function
     pub fn upsert_if<F>(&mut self, key: K, val: Option<V>, cond: F) -> Option<V> where 
         F: Fn(Option<V>) -> bool {
-
-        coz::scope!("upsert_if");
 
         // Initialize initial node and height
         let mut h = H - 1;
@@ -196,7 +344,7 @@ impl<K, V, const H: usize, const C: usize> MemTable<K, V> for SkipLift<K, V, H, 
     }
 
     fn read(&mut self, key: K) -> Result<V, NotFound> {
-        let val = self.upsert_if(key, None, |_| false);
+        let val = self.upsert_if(key, None, |d| false);
 
         val.ok_or(NotFound)
     }
@@ -242,7 +390,7 @@ mod tests {
         let iters = 1_000_000;
 
         for _ in 0..iters {
-            let _ = lift.read(key);
+            let _ = lift.get(key);
         }
 
         println!("{:.2?}", start.elapsed() / iters);
@@ -251,7 +399,7 @@ mod tests {
     use test::Bencher;
 
     #[bench]
-    fn memtable_read(b: &mut Bencher) {
+    fn memtable_read_alt(b: &mut Bencher) {
         let mut lift = <
             SkipLift::<usize, usize, 32, 32> as 
             memtable::MemTable<usize, usize>
@@ -259,16 +407,37 @@ mod tests {
 
 
         let keys: Vec<usize> = (0..1_000).map(|_| random()).collect();
+        let k: usize = random();
 
 
-        for k in &keys {
-            let _ = lift.create(*k, 0);
+        for k in keys {
+            let _ = lift.upsert(k, 0);
         }
 
         b.iter(|| {
-            for k in &keys {
-                let _ = lift.read(*k);
-            }
+            let _ = lift.get(k);
+        });
+
+    }
+    
+    #[bench]
+    fn memtable_read(b: &mut Bencher) {
+        let mut lift = <
+            SkipLift::<usize, usize, 32, 32> as 
+            memtable::MemTable<usize, usize>
+            >::new(None);
+
+
+        let keys: Vec<usize> = (0..1_000_000).map(|_| random()).collect();
+        let k: usize = random();
+
+
+        for k in keys {
+            let _ = lift.create(k, 0);
+        }
+
+        b.iter(|| {
+            let _ = lift.read(k);
         });
 
     }
@@ -277,16 +446,16 @@ mod tests {
     fn btree_read(b: &mut Bencher) {
         let mut tree: BTreeMap<usize, usize> = std::collections::BTreeMap::new();
 
-        let keys: Vec<usize> = (0..1_000).map(|_| random()).collect();
+        let keys: Vec<usize> = (0..1_000_000).map(|_| random()).collect();
+        let k: usize = random();
 
-        for k in &keys {
-            tree.insert(*k, 0);
+
+        for k in keys {
+            tree.insert(k, 0);
         }
 
-        b.iter(move || {
-            for k in &keys {
-                let _ = tree.get(k);
-            }
+        b.iter(|| {
+            let _ = tree.get(&k);
         });
 
     }
