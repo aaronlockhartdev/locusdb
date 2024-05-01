@@ -1,3 +1,6 @@
+#![feature(test)]
+extern crate test;
+
 pub mod store;
 
 pub fn add(left: usize, right: usize) -> usize {

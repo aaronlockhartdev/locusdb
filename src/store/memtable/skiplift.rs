@@ -1,4 +1,6 @@
-use core::panic;
+extern crate test;
+
+use std::default::Default;
 use std::ptr::NonNull;
 use std::cmp::{PartialOrd, Ordering};
 
@@ -6,6 +8,12 @@ use rand::random;
 
 use bumpalo::Bump;
 
+use super::{MemTable, Collision, NotFound};
+
+// SkipList variant outlined in https://doi.org/10.1016/j.jda.2011.12.017
+//
+// SAFETY: Makes no guarantees about thread safety, as its meant to be used
+// in a thread-per-core environment
 pub struct SkipLift<T, const H: usize> {
     // Due to bump allocation, it doesn't make sense to remove sentinel
     // nodes (because their memory won't be freed from the global allocator),
@@ -29,22 +37,15 @@ struct Node<T> {
     // ptr[0] is refering to the nodes before and after at self.height,
     // while ptr[1] is refering to the nodes before and after on the level
     // below
-    next: [Link<T>; 2],
     prev: [Link<T>; 2],
+    next: [Link<T>; 2],
     height: u8
 }
 
-struct Cursor<'a, T, const H: usize> {
-    lift: &'a SkipLift<T, H>,
-    // height is None iff we are at the header
-    height: Option<usize>,
-    // cur is None iff we are at a sentinel node
-    cur: Link<T>
-}
-
-impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
+impl<T, const H: usize> SkipLift<T, H> where
+    T: Copy + PartialOrd {
     // SAFETY: Panics if OOM
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             sentinels: [None; H],
             alloc: Bump::new()
@@ -61,12 +62,15 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
         bits.trailing_ones() as usize + 1
     }
 
-    pub fn upsert_if<F>(&mut self, data: T, cond: F) where 
-        F: Fn(Option<T>) -> bool {
+    // Implementation of general search/insert/update function
+    pub fn upsert_if<F>(&mut self, data: T, mut cond: F) where 
+        F: FnMut(Option<T>) -> bool {
 
+        // Initialize initial node and height
         let mut h = H - 1;
         let mut n: Link<T> = None;
 
+        // Allocate new node to stack
         let mut node = Node::<T> {
             data,
             prev: [None; 2],
@@ -74,8 +78,10 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
             height: Self::gen_height() as u8
         };
 
+        // idx is 0 or 1, keeps track of node.height vs node.height - 1
         let mut idx = 0;
 
+        // Search for value
         while h > 0 {
             while let Some(_n) = n {
                 let _n = unsafe { _n.as_ref() };
@@ -97,9 +103,11 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
 
                 match next_ref.data.partial_cmp(&data).unwrap() {
                     Ordering::Less => { 
+                        // Need to keep moving right
                         n = Some(next);
                     },
                     Ordering::Equal => {
+                        // Value found, update if cond(value)
                         if cond(Some(next_ref.data)) {
                             next_ref.data = data;
                         }
@@ -108,6 +116,9 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
                     Ordering::Greater => { break; }
                 }
             }
+            
+            // Keep track of current, next nodes for later insertion
+            // if we're at node.height or node.height - 1
             if idx < 2 && h == (node.height as usize) - idx {
                 node.prev[idx] = n;
                 node.next[idx] = n.map_or(
@@ -122,6 +133,12 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
             }
         }
 
+        // If value not found, insert only if cond(None)
+        if !cond(None) {
+            return;
+        }
+        
+        // Allocate space in bump allocator
         let node_ptr = unsafe { 
             NonNull::new_unchecked(
                 self.alloc.alloc(node)
@@ -132,6 +149,7 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
             node_ptr.as_ref()
         };
 
+        // Insert node between previously found nodes
         for idx in 0..=1 {
             if let Some(mut prev) = node_ref.prev[idx] {
                 let prev_ref = unsafe { prev.as_mut() };
@@ -150,310 +168,172 @@ impl<T: PartialOrd + Copy, const H: usize> SkipLift<T, H> {
         }
     }
 
-    pub fn insert(&mut self, data: T) {
-        let mut cur = Cursor::new(self);
+}
 
-        let height = Self::gen_height();
-        
-        let mut prev: [Link<T>; 2] = [None; 2];
-        let mut next: [Link<T>; 2] = [None; 2];
+// Implement MemTable for SkipLift
+#[derive(Copy, Clone)]
+struct KeyVal<K, V>(K, V)
+    where K: Copy, V: Copy;
 
-        let mut h = height as i16;
-
-        while {
-            (h + 1) as usize >= height && 
-            {
-                cur.at_height(h as usize) || 
-                cur.above_height(h as usize)
-            }
-        }{
-            while {
-                cur.peek_down().is_null() &&
-                !cur.peek_prev().is_null()
-            } {
-                cur.move_prev();
-            }
-
-            cur.move_down();
-
-            while let PeekResult::Data(d) = cur.peek_next() {
-                if d < data {
-                    cur.move_next();
-                } else if d == data {
-                    let n = unsafe { cur.ptr_next().unwrap().as_mut() };
-                    n.data = data;
-                    return;
-                } else {
-                    break;
-                }
-            }
-
-            if cur.at_height(h as usize) {
-                // Found correct place for ptr[idx]
-                let idx = height - h as usize;
-                prev[idx] = cur.cur;
-                next[idx] = cur.ptr_next();
-
-                h -= 1;
-            }
-        }
-
-        let node = NonNull::new(self.alloc.alloc_with(|| {
-            Node::<T> {
-                data,
-                next,
-                prev,
-                height: height as u8
-            }
-        }));
-        
-        for i in 0..=1 {
-            if let Some(mut p) = prev[i] {
-                let p = unsafe { p.as_mut() };
-                let idx = ((p.height as i16) - (height as i16) + (i as i16)) as usize;
-                p.next[idx] = node;
-            } else {
-                self.sentinels[height - i] = node;
-            }
-
-            if let Some(mut n) = next[i] {
-                let n = unsafe { n.as_mut() };
-                let idx = ((n.height as i16) - (height as i16) + (i as i16)) as usize;
-
-                n.prev[idx] = node;
-            }
-        }
-
+impl<K, V> PartialEq for KeyVal<K, V> where 
+    K: PartialEq + Copy, V: Copy {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
     }
 }
 
-enum PeekResult<T> {
-    Sentinel,
-    Data(T),
-    Null
-}
-
-impl<T> PeekResult<T> {
-    pub fn is_null(&self) -> bool {
-        if let Self::Null = self {
-            true
-        } else {
-            false
-        }
+impl<K, V> PartialOrd for KeyVal<K, V> where
+    K: PartialOrd + Copy, V: Copy {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
     }
 }
 
-impl<'a, T: Copy, const H: usize> Cursor<'a, T, H> {
-    pub fn new(skiplift: &'a mut SkipLift<T, H>) -> Self {
-        Self {
-            lift: skiplift,
-            height: None,
-            cur: None
-        }
+impl<K, V, const H: usize> MemTable<K, V> for SkipLift<KeyVal<K, V>, H> where 
+    K: PartialOrd + Copy, V: Default + Copy {
+
+    fn new(size: Option<usize>) -> Self { 
+        let lift = Self::new();
+        lift.alloc.set_allocation_limit(size);
+        lift
     }
 
-    // SAFETY: move_* functions will panic instead of erroring;
-    // case on the result of peek_* before calling them
-    //
-    // This decision was made to improve code legibility based on a 
-    // common pattern in algorithms of the skiplift paper, 
-    // where we traverse the lift while under a condition
-    //
-    // TODO: test/reduce overhead of double access, possibly with a
-    // conditional peek -> move function
-
-    fn move_next(&mut self) {
-        assert!(!self.peek_next().is_null());
-
-        if let Some(cur) = self.cur {
-            // We are not at a sentinel
-            let cur = unsafe { cur.as_ref() };
-            let idx: usize = cur.height as usize - self.height.unwrap();
-            self.cur = Some(cur.next[idx].unwrap());
-        } else {
-            self.cur = Some(self.lift.sentinels[self.height.unwrap()].unwrap());
-        }
-    }
-
-    fn move_prev(&mut self) {
-        assert!(!self.peek_prev().is_null());
-
-        let cur = unsafe { self.cur.unwrap().as_ref() };
-        let idx: usize = cur.height as usize - self.height.unwrap();
-        self.cur = cur.prev[idx];
-    }
-
-    #[allow(dead_code)]
-    fn move_up(&mut self) {
-        assert!(!self.peek_up().is_null());
-
-        if let Some(cur) = self.cur {
-            // We are not at a sentinel
-            let cur = unsafe { cur.as_ref() };
-            if cur.height as usize != self.height.unwrap() { 
-                self.height = Some(self.height.unwrap() + 1);
-            } else {
-                panic!();
+    fn create(&mut self, key: K, val: V) -> Result<(), Collision> {
+        let mut res = Default::default();
+        SkipLift::upsert_if(
+            self, 
+            KeyVal(key, val),
+            |d| {
+                res = d.is_none();
+                d.is_none()
             }
-        } else {
-            // We are at a sentinel
-            self.height = if self.height.unwrap() < H - 1 {
-                Some(self.height.unwrap() + 1)
-            } else {
-                None
-            };
-        }
+        );
+
+        if res { Ok(()) } else { Err(Collision) }
     }
 
-    fn move_down(&mut self) {
-        assert!(!self.peek_down().is_null());
+    fn read(&mut self, key: K) -> Result<V, NotFound> {
+        let mut val = Default::default();
+        SkipLift::upsert_if(
+            self, 
+            KeyVal(key, Default::default()), 
+            |d| {
+                val = d.map(|v| v.1);
+                false
+            }
+        );
+
+        val.ok_or(NotFound)
+    }
+    
+    fn update(&mut self, key: K, new_val: V) -> Result<V, NotFound> {
+        let mut val = Default::default();
+        SkipLift::upsert_if(
+            self, 
+            KeyVal(key, new_val), 
+            |d| {
+                val = d.map(|v| v.1);
+                d.is_some()
+            }
+        );
         
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };
-            if cur.height as usize == self.height.unwrap() {
-                self.height = Some(self.height.unwrap() - 1);
-            } else {
-                panic!();
-            }
-        } else {
-            self.height = if let Some(height) = self.height {
-                if height > 0 {
-                    Some(height - 1)
-                } else {
-                    panic!()
-                }
-            } else { Some(H - 1) };
-        }
-    }
-
-    fn peek_next(&self) -> PeekResult<T> {
-        if let Some(cur) = self.cur {
-            // We are not at a sentinel
-            let cur = unsafe { cur.as_ref() };
-            let idx: usize = cur.height as usize - self.height.unwrap();
-            if let Some(next) = cur.next[idx] {
-                PeekResult::Data(unsafe { 
-                    next.as_ref().data 
-                })
-            } else {
-                PeekResult::Null
-            }
-        } else {
-            if let Some(height) = self.height {
-                if let Some(next) = self.lift.sentinels[height] {
-                    PeekResult::Data(unsafe {
-                        next.as_ref().data
-                    })
-                } else {
-                    PeekResult::Null
-                }
-            } else {
-                PeekResult::Null
-            }
-        }
-    }
-
-    fn peek_prev(&self) -> PeekResult<T> {
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };      
-            let idx: usize = cur.height as usize - self.height.unwrap();
-            if let Some(prev) = cur.prev[idx] {
-                PeekResult::Data(unsafe {
-                    prev.as_ref().data
-                })
-            } else {
-                PeekResult::Sentinel
-            }
-        } else {
-            PeekResult::Null
-        }
-    }
-
-    #[allow(dead_code)]
-    fn peek_up(&self) -> PeekResult<T> {
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };
-            if self.height.unwrap() != cur.height as usize {
-                PeekResult::Data(cur.data)
-            } else {
-                PeekResult::Null
-            }
-        } else {
-            if let Some(_) = self.height {
-                PeekResult::Sentinel 
-            } else {
-                PeekResult::Null
-            }
-        }
-    }
-
-    fn peek_down(&self) -> PeekResult<T> {
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };
-            if self.height.unwrap() == cur.height as usize {
-                PeekResult::Data(cur.data)
-            } else {
-                PeekResult::Null
-            }
-        } else {
-            if let Some(height) = self.height {
-                if height > 0 { PeekResult::Sentinel } 
-                else { PeekResult::Null }
-            } else { PeekResult::Sentinel }
-        }
-    }
-
-    fn ptr_next(&self) -> Link<T> {
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };
-            let idx = cur.height as usize - self.height.unwrap();
-            cur.next[idx]
-        } else {
-            if let Some(height) = self.height {
-                self.lift.sentinels[height]
-            } else { None }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn ptr_prev(&self) -> Link<T> {
-        if let Some(cur) = self.cur {
-            let cur = unsafe { cur.as_ref() };
-            let idx = cur.height as usize - self.height.unwrap();
-            cur.prev[idx]
-        } else { None }
-    }
-
-    fn above_height(&self, height: usize) -> bool {
-        if let Some(current_height) = self.height {
-            current_height > height
-        } else {
-            true
-        }
-    }
-
-    fn at_height(&self, height: usize) -> bool {
-        if let Some(current_height) = self.height {
-            current_height == height
-        } else {
-            false
-        }
+        val.ok_or(NotFound)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SkipLift;
+    use rand::random;
+    use std::{collections::BTreeMap, time};
+
+    use super::{KeyVal, SkipLift};
+    use crate::store::memtable::{self, MemTable};
+
 
     #[test]
     fn basic_small() {
         let mut lift = SkipLift::<i64, 16>::new();
             
-        for _ in 0..1_000_000 {
+        for _ in 0..1_000 {
             lift.upsert_if(1, |x| match x {
                 Some(_) => true,
                 None => true
             });
         }
+    }
+
+    #[test]
+    fn memtable_small() {
+        let mut lift = <
+            SkipLift::<KeyVal<usize, usize>, 32> as 
+            memtable::MemTable<usize, usize>
+            >::new(None);
+
+        let key: usize = random();
+
+        lift.create(key, random()).unwrap();
+
+        for i in 0..1_000 {
+            assert!(lift.create(key, i).is_err());
+
+            let _ = lift.create(random(), i);
+        }
+
+        lift.update(key, 1).unwrap();
+
+        assert!(lift.read(key).unwrap() == 1);
+
+        let start = time::Instant::now();
+
+        let iters = 1_000_000;
+
+        for _ in 0..iters {
+            let _ = lift.read(key);
+        }
+
+        println!("{:.2?}", start.elapsed() / iters);
+    }
+
+    use test::Bencher;
+
+    
+    #[bench]
+    fn memtable_read(b: &mut Bencher) {
+        let mut lift = <
+            SkipLift::<KeyVal<usize, usize>, 32> as 
+            memtable::MemTable<usize, usize>
+            >::new(None);
+
+
+        let keys: Vec<usize> = (0..1_000_000).map(|_| random()).collect();
+        let k: usize = random();
+
+
+        for k in keys {
+            let _ = lift.create(k, 0);
+        }
+
+        b.iter(|| {
+            let _ = lift.read(k);
+        });
+
+    }
+
+    #[bench]
+    fn btree_read(b: &mut Bencher) {
+        let mut tree: BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
+        let keys: Vec<usize> = (0..1_000_000).map(|_| random()).collect();
+        let k: usize = random();
+
+
+        for k in keys {
+            tree.insert(k, 0);
+        }
+
+        b.iter(|| {
+            let _ = tree.get(&k);
+        });
+
     }
 }

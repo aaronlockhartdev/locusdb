@@ -2,17 +2,20 @@ mod skiplift;
 
 pub use skiplift::SkipLift;
 
-use std::error::Error;
-use std::iter::Iterator;
-use std::cmp::Ord;
+//use std::iter::IntoIterator;
+use std::cmp::PartialOrd;
 
-type Res<T> = Result<T, Box<dyn Error>>;
+#[derive(Debug)]
+pub struct NotFound;
 
-pub trait MemTable<K: Ord, V>: Iterator{
+#[derive(Debug)]
+pub struct Collision;
+
+// The default value of V should be the tombstone value
+pub trait MemTable<K: PartialOrd, V: Default> {
     fn new(size: Option<usize>) -> Self;
-    fn create(&self, key: K, val: V) -> Res<()>;
-    fn read(&self, key: K) -> Res<V>;
-    fn update(&self, key: K, new_val: V) -> Res<V>;
-    fn delete(&self, key: K) -> Res<V>;
+    fn create(&mut self, key: K, val: V) -> Result<(), Collision>;
+    fn read(&mut self, key: K) -> Result<V, NotFound>;
+    fn update(&mut self, key: K, new_val: V) -> Result<V, NotFound>;
 }
 
