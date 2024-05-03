@@ -15,7 +15,7 @@ pub struct Collision;
 pub trait MemTable<K: PartialOrd, V> {
     fn new(size: Option<usize>) -> Self;
     fn create(&mut self, key: K, val: V) -> Result<(), Collision>;
-    fn read(&mut self, key: K) -> Result<V, NotFound>;
-    fn update(&mut self, key: K, new_val: V) -> Result<V, NotFound>;
+    fn read(&mut self, key: &K) -> Result<&V, NotFound>;
+    fn update(&mut self, key: &K, new_val: &V) -> Result<(), NotFound>;
 }
 
